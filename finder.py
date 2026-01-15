@@ -30,24 +30,29 @@ if not GEMINI_KEY:
 
 HEADERS = {"User-Agent": "VendorContactFinder/1.0 (+contact: you@example.com)"}
 
+# IMPORTANT: We still keep CONTACT_HINTS for broad matching,
+# but scoring will prioritize "contact" > "imprint/legal" > "sales/team" > "locations" > "about"
 CONTACT_HINTS = (
     "contact", "contact-us", "kontakt",
-    "about", "about-us", "unternehmen", "ueber-uns", "über-uns",
     "impressum", "imprint", "legal",
-    "locations", "location", "store-locator", "find-us", "findus",
+    "sales", "team", "staff", "people",
+    "locations", "location", "store-locator", "where-to-buy", "find-us", "findus",
+    "about", "about-us", "unternehmen", "ueber-uns", "über-uns",
 )
 
+# IMPORTANT: Try CONTACT first, then imprint/legal, then sales/team, then locations, then about
 COMMON_FALLBACK_PATHS = (
     "/contact", "/contact-us", "/kontakt",
-    "/about", "/about-us", "/ueber-uns", "/über-uns",
     "/impressum", "/imprint", "/legal",
-    "/locations", "/location", "/store-locator"
+    "/sales", "/team", "/staff", "/people",
+    "/where-to-buy", "/locations", "/location", "/store-locator",
+    "/about", "/about-us", "/ueber-uns", "/über-uns",
 )
 
 MAX_HTML_CHARS_PER_SITE = 120_000     # cost control
 THREADS = 12                          # crawl parallelism
 GEMINI_BATCH_SIZE = 3                 # 2-3 websites per call
-POLITE_DELAY = 0.2                    # small delay to be polite
+POLITE_DELAY = 0.15                   # keep low but non-zero
 
 
 # ----------------------------
@@ -58,7 +63,6 @@ def parse_json_loose(raw: str) -> Any:
     try:
         return json.loads(raw)
     except Exception:
-        # Try to extract first JSON object or array
         m_obj = re.search(r"\{.*\}", raw, re.DOTALL)
         if m_obj:
             return json.loads(m_obj.group(0))
@@ -69,12 +73,6 @@ def parse_json_loose(raw: str) -> Any:
 
 
 def normalize_candidates(discovery: Any) -> List[Dict[str, str]]:
-    """
-    Accepts either:
-      - {"candidates":[{...}]}  (dict)
-      - [{...}, {...}]         (list)
-    Returns a list of {business_name, website}.
-    """
     if isinstance(discovery, dict):
         candidates = discovery.get("candidates", [])
     elif isinstance(discovery, list):
@@ -94,12 +92,6 @@ def normalize_candidates(discovery: Any) -> List[Dict[str, str]]:
 
 
 def normalize_gemini_vendors(extracted: Any) -> List[Dict[str, Any]]:
-    """
-    Accepts either:
-      - {"vendors":[{...}]} (dict)
-      - [{...}, {...}]      (list)
-    Returns list of vendor dicts.
-    """
     if isinstance(extracted, dict):
         vendors = extracted.get("vendors", [])
     elif isinstance(extracted, list):
@@ -153,6 +145,7 @@ User query: {user_query}
 Return up to {max_candidates} candidate companies with official websites.
 JSON only.
 """
+    print(f"[DISCOVER] Query: {user_query}")
     resp = pplx_client.chat.completions.create(
         model="sonar",
         messages=[
@@ -162,8 +155,9 @@ JSON only.
     )
     raw = resp.choices[0].message.content
     parsed = parse_json_loose(raw)
-    candidates = normalize_candidates(parsed)
-    return candidates[:max_candidates]
+    candidates = normalize_candidates(parsed)[:max_candidates]
+    print(f"[DISCOVER] Found {len(candidates)} candidate websites")
+    return candidates
 
 
 # ----------------------------
@@ -211,14 +205,39 @@ def extract_internal_links(base_url: str, html: str, limit: int = 250) -> List[s
     return list(dict.fromkeys(links))
 
 def score_contact_link(url: str) -> Tuple[int, int]:
+    """
+    Prioritize:
+      0) contact
+      1) impressum/imprint/legal
+      2) sales/team/staff/people
+      3) locations/where-to-buy/store-locator
+      4) about
+      5) everything else
+    """
     path = (urlparse(url).path or "").lower()
-    hint_score = 0 if any(h in path for h in CONTACT_HINTS) else 1
-    return (hint_score, len(path))
+
+    if any(k in path for k in ["contact", "contact-us", "kontakt"]):
+        bucket = 0
+    elif any(k in path for k in ["impressum", "imprint", "legal"]):
+        bucket = 1
+    elif any(k in path for k in ["sales", "team", "staff", "people"]):
+        bucket = 2
+    elif any(k in path for k in ["where-to-buy", "locations", "location", "store-locator", "find-us", "findus"]):
+        bucket = 3
+    elif any(k in path for k in ["about", "about-us", "ueber-uns", "über-uns", "unternehmen"]):
+        bucket = 4
+    else:
+        bucket = 5
+
+    # Shorter paths generally better; also prefer non-empty paths
+    return (bucket, len(path))
 
 def pick_best_contact_page(home_url: str, home_html: str) -> Optional[str]:
     links = extract_internal_links(home_url, home_html)
     links_sorted = sorted(links, key=score_contact_link)
-    for u in links_sorted[:80]:
+
+    # Choose first strongly relevant link
+    for u in links_sorted[:120]:
         path = (urlparse(u).path or "").lower()
         if any(h in path for h in CONTACT_HINTS):
             return u
@@ -234,6 +253,7 @@ def try_fallback_paths(home_url: str) -> Optional[str]:
             return candidate
         time.sleep(POLITE_DELAY)
     return None
+
 
 @dataclass
 class CrawledSite:
@@ -251,53 +271,66 @@ def normalize_website(url: str) -> str:
 def crawl_one_site(business_name: str, website: str) -> Optional[CrawledSite]:
     website = normalize_website(website)
 
+    print(f"[CRAWL] Start: {business_name} -> {website}")
     home_html = fetch_html(website)
     if not home_html:
+        print(f"[CRAWL] FAIL homepage fetch: {website}")
         return None
 
-    # 1) try contact/about link found in homepage
-    contact_url = pick_best_contact_page(website, home_html)
-    if contact_url:
-        contact_html = fetch_html(contact_url)
-        if contact_html:
+    # 1) try best prioritized page found in homepage links
+    best_url = pick_best_contact_page(website, home_html)
+    if best_url:
+        print(f"[CRAWL] Selected from links: {best_url}")
+        page_html = fetch_html(best_url)
+        if page_html:
+            cleaned = clean_and_truncate_html(page_html)
+            print(f"[CRAWL] OK page fetch: {best_url} (chars={len(cleaned)})")
             return CrawledSite(
                 business_name=business_name,
                 website=website,
-                source_page=contact_url,
-                html=clean_and_truncate_html(contact_html)
+                source_page=best_url,
+                html=cleaned
             )
+        else:
+            print(f"[CRAWL] FAIL page fetch (selected): {best_url}")
 
-    # 2) fallback paths
+    # 2) fallback paths (contact first)
     fallback = try_fallback_paths(website)
     if fallback:
+        print(f"[CRAWL] Selected fallback: {fallback}")
         fb_html = fetch_html(fallback)
         if fb_html:
+            cleaned = clean_and_truncate_html(fb_html)
+            print(f"[CRAWL] OK fallback fetch: {fallback} (chars={len(cleaned)})")
             return CrawledSite(
                 business_name=business_name,
                 website=website,
                 source_page=fallback,
-                html=clean_and_truncate_html(fb_html)
+                html=cleaned
             )
+        else:
+            print(f"[CRAWL] FAIL fallback fetch: {fallback}")
 
     # 3) homepage fallback
+    cleaned_home = clean_and_truncate_html(home_html)
+    print(f"[CRAWL] Using homepage fallback (chars={len(cleaned_home)})")
     return CrawledSite(
         business_name=business_name,
         website=website,
         source_page=website,
-        html=clean_and_truncate_html(home_html)
+        html=cleaned_home
     )
 
 def crawl_sites_parallel(candidates: List[Dict[str, str]], threads: int = THREADS) -> List[CrawledSite]:
     crawled: List[CrawledSite] = []
+    print(f"[CRAWL] Parallel crawling with {threads} threads...")
     with ThreadPoolExecutor(max_workers=threads) as ex:
-        futures = []
-        for c in candidates:
-            futures.append(ex.submit(crawl_one_site, c["business_name"], c["website"]))
-
+        futures = [ex.submit(crawl_one_site, c["business_name"], c["website"]) for c in candidates]
         for fut in as_completed(futures):
             item = fut.result()
             if item:
                 crawled.append(item)
+    print(f"[CRAWL] Completed. Successfully crawled {len(crawled)} sites.")
     return crawled
 
 
@@ -336,6 +369,7 @@ Schema (return exactly this shape):
 
 Rules:
 - business_name: prefer official legal/company name in HTML; else business_name_hint; else null.
+- Also extract obfuscated emails like "info (at) domain (dot) com" if present.
 - Exclude placeholder emails like example@domain.com.
 - Deduplicate phones/emails/addresses.
 """
@@ -344,6 +378,7 @@ def chunk_list(items: List[Any], size: int) -> List[List[Any]]:
     return [items[i:i+size] for i in range(0, len(items), size)]
 
 def gemini_extract_batch(batch: List[CrawledSite]) -> List[Dict[str, Any]]:
+    print(f"[GEMINI] Extracting batch of {len(batch)} site(s)...")
     items = []
     for s in batch:
         items.append({
@@ -363,7 +398,9 @@ def gemini_extract_batch(batch: List[CrawledSite]) -> List[Dict[str, Any]]:
 
     raw = (resp.text or "").strip()
     parsed = parse_json_loose(raw)
-    return normalize_gemini_vendors(parsed)
+    vendors = normalize_gemini_vendors(parsed)
+    print(f"[GEMINI] Batch done. Extracted {len(vendors)} vendor record(s).")
+    return vendors
 
 
 # ----------------------------
@@ -375,6 +412,9 @@ def run_pipeline(user_query: str, max_candidates: int = 10) -> Dict[str, Any]:
     if not candidates:
         return {"vendors": []}
 
+    for i, c in enumerate(candidates, start=1):
+        print(f"[DISCOVER] {i}. {c['business_name']} -> {c['website']}")
+
     # 2) Crawl in parallel
     crawled = crawl_sites_parallel(candidates, threads=THREADS)
     if not crawled:
@@ -382,7 +422,11 @@ def run_pipeline(user_query: str, max_candidates: int = 10) -> Dict[str, Any]:
 
     # 3) Gemini extraction in batches (2-3 per call)
     all_vendors: List[Dict[str, Any]] = []
-    for batch in chunk_list(crawled, GEMINI_BATCH_SIZE):
+    batches = chunk_list(crawled, GEMINI_BATCH_SIZE)
+    print(f"[PIPELINE] Sending {len(crawled)} crawled pages to Gemini in {len(batches)} batch(es)...")
+
+    for idx, batch in enumerate(batches, start=1):
+        print(f"[PIPELINE] Gemini batch {idx}/{len(batches)}")
         vendors = gemini_extract_batch(batch)
         all_vendors.extend(vendors)
         time.sleep(0.2)  # avoid hammering API
