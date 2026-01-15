@@ -1,12 +1,28 @@
-# fast_one_call_gemini.py
-# Speed-optimized: fail-fast timeouts, smaller downloads, skip extra page if homepage already has contact signals,
-# parallel fetch, single Gemini call, no debug/json dumps.
+# chatgpt_like_rank_then_contact.py
+# - Handles BOTH intents:
+#   A) "top/best/leading/largest companies in X"  -> RANK THEN CONTACT (ChatGPT-like)
+#      * Gemini call #1: extract top company names from list/report sources
+#      * Then: find official sites + extract contact info deterministically (no extra LLM call)
+#   B) "find contact of <company>" / narrow business discovery -> CONTACT ONLY
+#      * No ranking; goes straight to official site + contact extraction (no LLM required)
+#
+# - SerpAPI for search
+# - Fetch a few high-signal pages per company (homepage + contact/about/legal + optional /directory)
+# - Extract contacts via:
+#   * mailto: / tel:
+#   * schema.org JSON-LD (Organization)
+#   * signal lines near address/phone/email hints (footer/header included naturally)
+#
+# Requirements:
+#   .env must include:
+#     SERPAPI_API_KEY
+#     GEMINI_API_KEY (or GOOGLE_API_KEY)
 
 import os
 import re
 import json
 from urllib.parse import urlparse, urljoin
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple, Set
 
 import requests
 import tldextract
@@ -14,46 +30,76 @@ from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-from google import genai
+from start import genai
 from google.genai import types
 
 
 # -----------------------------
-# CONFIG (speed-focused)
+# CONFIG
 # -----------------------------
 SERPAPI_ENDPOINT = "https://serpapi.com/search.json"
 
-HEADERS = {
+HTTP_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
         "Chrome/120.0 Safari/537.36"
-    )
+    ),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
 }
 
-MAX_SERP_RESULTS = 20
-MAX_WORKERS = 12
+TIMEOUT = (5, 12)                # (connect, read)
+MAX_HTML_BYTES = 900_000         # cap per page
+MAX_WORKERS = 14
 
-# Fail fast (connect, read)
-TIMEOUT = (5, 8)
+# How many companies to output in rank mode
+TOP_N = 10
 
-# Download less (we only need footer/header + signal lines)
-MAX_HTML_BYTES = 250_000
+# Rank-mode search (list/report sources)
+RANK_SERP_PAGES = 3              # 0,10,20
+RANK_SERP_PAGE_SIZE = 10
+RANK_FETCH_PAGES = 8             # fetch this many list pages as evidence
 
-# Only allow one extra contact/about page
-KEYWORDS = ["contact", "contact-us", "contactus", "about", "about-us", "aboutus", "company", "team", "who-we-are"]
-FALLBACK_PATHS = ["/contact", "/contact-us", "/about", "/about-us", "/company"]
+# Contact-mode search (official site discovery)
+OFFICIAL_SERP_PAGES = 2
+OFFICIAL_SERP_PAGE_SIZE = 10
 
-# Keep one-call payload compact
-MAX_SNIPPET_CHARS_PER_PAGE = 6000
-MAX_SITE_CHARS = 10_000
-MAX_TOTAL_INPUT_CHARS = 160_000  # overall input budget to keep a single call safe
+# Contact pages to try per official domain
+MAX_PAGES_PER_COMPANY = 4        # homepage + best contact-like + optional legal + optional /directory
+TRY_DIRECTORY = True
 
+KEYWORDS = [
+    "contact", "contact-us", "contactus",
+    "about", "about-us", "aboutus",
+    "imprint", "impressum", "legal", "privacy",
+    "company", "team", "who-we-are",
+    "support", "customer-service",
+    "locations", "office", "find-us",
+]
+FALLBACK_PATHS = [
+    "/contact", "/contact-us", "/about", "/about-us",
+    "/imprint", "/impressum", "/legal", "/privacy",
+    "/company", "/support"
+]
 
-# -----------------------------
-# Regex helpers
-# -----------------------------
-EMAIL_RE = re.compile(r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}", re.IGNORECASE)
+# Basic filtering
+BAD_DOMAINS_DEFAULT = {
+    "facebook.com", "m.facebook.com", "linkedin.com", "twitter.com", "x.com",
+    "youtube.com", "instagram.com", "tiktok.com",
+    "alibaba.com", "aliexpress.com", "amazon.com", "ebay.com",
+    "indiamart.com", "made-in-china.com", "globalsources.com",
+    "tradeindia.com", "ecplaza.net", "exportersindia.com",
+    "yellowpages.com", "yelp.com", "justdial.com",
+    "mapquest.com",
+}
+# In RANK mode we ALLOW Wikipedia (helps a lot for “top companies” recall)
+RANK_ALLOW_DOMAINS = {"wikipedia.org"}
+
+BAD_EXTENSIONS = (".pdf", ".doc", ".docx", ".ppt", ".pptx", ".xls", ".xlsx")
+
+# Extraction regex
+EMAIL_RE = re.compile(r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b", re.IGNORECASE)
 PHONE_RE = re.compile(r"(\+?\d[\d\s().\-]{6,}\d)")
 ADDR_HINT_RE = re.compile(
     r"\b(address|office|location|registered|hq|headquarters|"
@@ -63,11 +109,10 @@ ADDR_HINT_RE = re.compile(
     re.IGNORECASE
 )
 
-
 # -----------------------------
-# Basics
+# Utilities
 # -----------------------------
-def load_keys():
+def load_keys() -> None:
     load_dotenv()
     if not os.getenv("SERPAPI_API_KEY"):
         raise RuntimeError("Missing SERPAPI_API_KEY in .env")
@@ -84,38 +129,70 @@ def dom(url: str) -> str:
 
 def root(url: str) -> str:
     p = urlparse(url)
-    return f"{p.scheme or 'https'}://{p.netloc}"
+    scheme = p.scheme or "https"
+    return f"{scheme}://{p.netloc}"
+
+
+def normalize_url(u: Any) -> Optional[str]:
+    if not isinstance(u, str):
+        return None
+    u = u.strip()
+    if not u.startswith(("http://", "https://")):
+        return None
+    return u
+
+
+def is_bad_url(u: str, rank_mode: bool = False) -> bool:
+    ul = u.lower()
+    if ul.endswith(BAD_EXTENSIONS):
+        return True
+
+    d = dom(u)
+    if rank_mode and d in RANK_ALLOW_DOMAINS:
+        return False
+
+    if d in BAD_DOMAINS_DEFAULT:
+        return True
+
+    noisy_bits = ["/login", "/signin", "/sign-in", "/watch", "/posts", "/share", "/photo", "/videos"]
+    if any(b in ul for b in noisy_bits):
+        return True
+
+    return False
+
+
+def add_directory_path(url: str) -> str:
+    return urljoin(url if url.endswith("/") else (url + "/"), "directory")
+
+
+def safe_dedupe_preserve_order(items: List[str]) -> List[str]:
+    seen = set()
+    out = []
+    for x in items:
+        if x not in seen:
+            seen.add(x)
+            out.append(x)
+    return out
 
 
 # -----------------------------
-# SerpAPI
+# Intent detection (no LLM needed)
 # -----------------------------
-def serpapi_links(session: requests.Session, query: str, n: int = 20) -> List[str]:
-    params = {"engine": "google", "q": query, "api_key": os.getenv("SERPAPI_API_KEY"), "num": min(n, 20)}
-    r = session.get(SERPAPI_ENDPOINT, params=params, timeout=TIMEOUT)
-    r.raise_for_status()
-    data = r.json()
-
-    links = []
-    for item in (data.get("organic_results") or []):
-        u = item.get("link")
-        if isinstance(u, str) and u.startswith(("http://", "https://")):
-            links.append(u)
-
-    seen, out = set(), []
-    for u in links:
-        if u not in seen:
-            seen.add(u)
-            out.append(u)
-    return out[:n]
+RANK_WORDS = {
+    "best", "top", "largest", "leading", "biggest", "rank", "ranking", "list",
+    "companies", "company", "manufacturers", "suppliers", "brands"
+}
+def is_rank_query(q: str) -> bool:
+    ql = q.lower()
+    return any(w in ql for w in RANK_WORDS)
 
 
 # -----------------------------
-# Fetching (fast)
+# HTTP Fetch
 # -----------------------------
 def fetch_html(session: requests.Session, url: str) -> Optional[str]:
     try:
-        with session.get(url, headers=HEADERS, timeout=TIMEOUT, stream=True, allow_redirects=True) as r:
+        with session.get(url, headers=HTTP_HEADERS, timeout=TIMEOUT, stream=True, allow_redirects=True) as r:
             r.raise_for_status()
             chunks, total = [], 0
             for chunk in r.iter_content(65536):
@@ -130,7 +207,340 @@ def fetch_html(session: requests.Session, url: str) -> Optional[str]:
         return None
 
 
-def best_about_contact_url(base: str, html: str) -> Optional[str]:
+# -----------------------------
+# SerpAPI helpers
+# -----------------------------
+def serpapi_search(session: requests.Session, q: str, num: int, start: int) -> List[Dict[str, Any]]:
+    params = {
+        "engine": "google",
+        "q": q,
+        "api_key": os.getenv("SERPAPI_API_KEY"),
+        "num": num,
+        "start": start,
+    }
+    r = session.get(SERPAPI_ENDPOINT, params=params, timeout=TIMEOUT)
+    r.raise_for_status()
+    data = r.json()
+    out = []
+    for item in (data.get("organic_results") or []):
+        link = normalize_url(item.get("link"))
+        if not link:
+            continue
+        out.append({
+            "link": link,
+            "title": item.get("title") or "",
+            "snippet": item.get("snippet") or ""
+        })
+    return out
+
+
+def pick_rank_sources(results: List[Dict[str, Any]], want: int) -> List[str]:
+    """
+    Prefer list/report pages, allow Wikipedia, avoid social/marketplaces.
+    """
+    def score(r: Dict[str, Any]) -> int:
+        u = (r["link"] or "").lower()
+        t = (r.get("title") or "").lower()
+        s = (r.get("snippet") or "").lower()
+        sc = 0
+
+        # good cues for ranking/list sources
+        for kw in ["top", "best", "largest", "leading", "list", "ranking", "companies", "pharmaceutical", "industry"]:
+            if kw in t or kw in s:
+                sc += 2
+
+        # wikipedia can be useful in rank mode
+        if "wikipedia.org" in u:
+            sc += 3
+
+        # discourage obvious directory/listing spam
+        for bad in ["yellowpages", "yelp", "justdial", "directory", "listing", "profile", "marketplace"]:
+            if bad in u or bad in t or bad in s:
+                sc -= 4
+
+        # short paths can be official, but in rank mode we want list articles too
+        if u.count("/") <= 3:
+            sc += 1
+
+        return sc
+
+    ranked = sorted(results, key=score, reverse=True)
+    urls = []
+    for r in ranked:
+        u = r["link"]
+        if not is_bad_url(u, rank_mode=True):
+            urls.append(u)
+    return safe_dedupe_preserve_order(urls)[:want]
+
+
+def pick_official_site_candidates(results: List[Dict[str, Any]], want: int) -> List[str]:
+    """
+    Prefer likely official websites (shorter URLs, "official" cues; avoid directories/social).
+    Unique by domain.
+    """
+    def score(r: Dict[str, Any]) -> int:
+        u = (r["link"] or "").lower()
+        t = (r.get("title") or "").lower()
+        s = (r.get("snippet") or "").lower()
+        sc = 0
+
+        for kw in ["official", "contact", "about", "imprint", "impressum"]:
+            if kw in t or kw in s:
+                sc += 3
+        # discourage big platforms
+        for bad in ["wikipedia", "linkedin", "facebook", "instagram", "youtube", "twitter", "x.com"]:
+            if bad in u:
+                sc -= 5
+
+        # shorter paths tend to be homepages
+        if u.count("/") <= 3:
+            sc += 2
+        return sc
+
+    ranked = sorted(results, key=score, reverse=True)
+
+    seen_domains = set()
+    picked = []
+    for r in ranked:
+        u = r["link"]
+        if is_bad_url(u, rank_mode=False):
+            continue
+        d = dom(u)
+        if d in seen_domains:
+            continue
+        seen_domains.add(d)
+        picked.append(u)
+        if len(picked) >= want:
+            break
+    return picked
+
+
+# -----------------------------
+# Rank mode: fetch sources and ask Gemini for top company names
+# -----------------------------
+def html_to_readable_text(html: str, url: str, max_chars: int = 25_000) -> str:
+    soup = BeautifulSoup(html, "html.parser")
+    for tag in soup(["script", "style", "noscript", "svg", "canvas", "form"]):
+        tag.decompose()
+    text = soup.get_text("\n")
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    # keep first N lines; list pages usually have names early
+    out = f"URL: {url}\n" + "\n".join(lines[:1200])
+    return out[:max_chars]
+
+
+def gemini_extract_top_companies(client: genai.Client, sources: List[str], country_hint: str, industry_hint: str, top_n: int) -> List[str]:
+    """
+    Gemini call #1 (only in rank mode): from list/report sources, output company names.
+    """
+    prompt = f"""
+You are identifying the TOP companies from multiple web sources.
+
+Task:
+- Extract the top {top_n} company names for this query: "{industry_hint} companies in {country_hint}".
+- Use ONLY the provided source text.
+- Prefer widely-known/large/leading companies that are repeatedly mentioned across sources.
+- Output JSON ONLY:
+{{ "companies": [ "Company A", "Company B", ... ] }}
+
+Rules:
+- Do NOT invent names not present in sources.
+- Deduplicate names (case/spacing).
+- If sources conflict, prefer names that appear in multiple sources.
+- Keep names as official as possible (e.g., "Square Pharmaceuticals Ltd." not "Square Pharma").
+SOURCES:
+{json.dumps(sources, ensure_ascii=False)}
+""".strip()
+
+    resp = client.models.generate_content(
+        model="gemini-2.5-pro",
+        contents=prompt,
+        config=types.GenerateContentConfig(response_mime_type="application/json", temperature=0.2),
+    )
+
+    raw = resp.text or "{}"
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        data = {}
+    companies = data.get("companies", [])
+    if not isinstance(companies, list):
+        return []
+    cleaned = []
+    for c in companies:
+        if isinstance(c, str):
+            c2 = c.strip()
+            if c2:
+                cleaned.append(c2)
+    return cleaned[:top_n]
+
+
+def infer_country_and_industry(user_query: str) -> Tuple[str, str]:
+    """
+    Lightweight heuristic:
+    - country: last token-ish after 'in <country>' if present
+    - industry: rough noun phrase (fallback: 'companies')
+    """
+    ql = user_query.lower()
+    country = ""
+    industry = "companies"
+
+    # try "in <country>"
+    m = re.search(r"\bin\s+([a-z\s]+)$", ql)
+    if m:
+        country = m.group(1).strip().title()
+
+    # industry: pull a keyword if present
+    for k in ["pharmaceutical", "pharma", "garments", "software", "bank", "telecom", "cement", "steel"]:
+        if k in ql:
+            industry = "pharmaceutical" if k in ["pharmaceutical", "pharma"] else k
+            break
+
+    if not country:
+        country = "the specified country"
+    return country, industry
+
+
+# -----------------------------
+# Contact extraction: evidence from a few pages, deterministic parsing
+# -----------------------------
+def extract_mailto_tel(soup: BeautifulSoup) -> Tuple[Set[str], Set[str]]:
+    emails, phones = set(), set()
+    for a in soup.find_all("a", href=True):
+        href = a["href"].strip()
+        hl = href.lower()
+        if hl.startswith("mailto:"):
+            e = href.split(":", 1)[1].split("?")[0].strip()
+            if e:
+                emails.add(e)
+        elif hl.startswith("tel:"):
+            p = href.split(":", 1)[1].strip()
+            if p:
+                phones.add(p)
+    return emails, phones
+
+
+def parse_jsonld_for_org(raw_html: str) -> Dict[str, Any]:
+    """
+    Parse schema.org JSON-LD blocks. Return best organization-ish fields found.
+    """
+    soup = BeautifulSoup(raw_html, "html.parser")
+    best = {"name": None, "emails": set(), "phones": set(), "address": None}
+
+    for tag in soup.find_all("script"):
+        t = (tag.get("type") or "").lower()
+        if "ld+json" not in t:
+            continue
+        content = (tag.string or tag.get_text() or "").strip()
+        if not content:
+            continue
+
+        # Sometimes multiple JSON objects / invalid JSON. Try best effort.
+        try:
+            data = json.loads(content)
+        except Exception:
+            continue
+
+        def walk(obj: Any) -> None:
+            if isinstance(obj, dict):
+                typ = obj.get("@type") or obj.get("type")
+                if isinstance(typ, list):
+                    typ = " ".join([str(x) for x in typ])
+                typ_s = str(typ).lower() if typ else ""
+
+                is_org = any(x in typ_s for x in ["organization", "corporation", "localbusiness", "pharmacy", "company"])
+                if is_org:
+                    nm = obj.get("name")
+                    if isinstance(nm, str) and nm.strip() and not best["name"]:
+                        best["name"] = nm.strip()
+
+                    em = obj.get("email")
+                    if isinstance(em, str) and em.strip():
+                        best["emails"].add(em.strip())
+                    if isinstance(em, list):
+                        for e in em:
+                            if isinstance(e, str) and e.strip():
+                                best["emails"].add(e.strip())
+
+                    tel = obj.get("telephone") or obj.get("phone")
+                    if isinstance(tel, str) and tel.strip():
+                        best["phones"].add(tel.strip())
+                    if isinstance(tel, list):
+                        for p in tel:
+                            if isinstance(p, str) and p.strip():
+                                best["phones"].add(p.strip())
+
+                    addr = obj.get("address")
+                    addr_str = address_to_string(addr)
+                    if addr_str and not best["address"]:
+                        best["address"] = addr_str
+
+                # recurse
+                for v in obj.values():
+                    walk(v)
+
+            elif isinstance(obj, list):
+                for it in obj:
+                    walk(it)
+
+        walk(data)
+
+    return {
+        "name": best["name"],
+        "emails": best["emails"],
+        "phones": best["phones"],
+        "address": best["address"],
+    }
+
+
+def address_to_string(addr: Any) -> Optional[str]:
+    if isinstance(addr, str):
+        a = addr.strip()
+        return a if a else None
+    if isinstance(addr, dict):
+        parts = []
+        for k in ["streetAddress", "postOfficeBoxNumber", "addressLocality", "addressRegion", "postalCode", "addressCountry"]:
+            v = addr.get(k)
+            if isinstance(v, str) and v.strip():
+                parts.append(v.strip())
+        joined = ", ".join(parts).strip()
+        return joined if joined else None
+    if isinstance(addr, list):
+        # take first good
+        for it in addr:
+            s = address_to_string(it)
+            if s:
+                return s
+    return None
+
+
+def get_title_or_og_name(raw_html: str) -> Optional[str]:
+    soup = BeautifulSoup(raw_html, "html.parser")
+    title = soup.find("title")
+    if title and title.get_text(strip=True):
+        return title.get_text(strip=True)[:120]
+    og = soup.find("meta", attrs={"property": "og:site_name"})
+    if og and og.get("content"):
+        return str(og["content"]).strip()[:120]
+    return None
+
+
+def signal_address_from_text(raw_html: str) -> Optional[str]:
+    soup = BeautifulSoup(raw_html, "html.parser")
+    for tag in soup(["script", "style", "noscript", "svg", "canvas"]):
+        tag.decompose()
+    lines = [ln.strip() for ln in soup.get_text("\n").splitlines() if ln.strip()]
+    # pick a small window around address hints
+    for i, ln in enumerate(lines):
+        if ADDR_HINT_RE.search(ln):
+            window = lines[i:i+4]
+            joined = " | ".join(window).strip()
+            # avoid huge
+            return joined[:220]
+    return None
+
+
+def best_contact_like_url(base: str, html: str) -> Optional[str]:
     soup = BeautifulSoup(html, "html.parser")
     base_dom = dom(base)
 
@@ -143,7 +553,7 @@ def best_about_contact_url(base: str, html: str) -> Optional[str]:
         u = urljoin(base, href)
         if not u.startswith(("http://", "https://")):
             continue
-        if dom(u) != base_dom or u == base:
+        if dom(u) != base_dom:
             continue
 
         score = 0
@@ -159,241 +569,380 @@ def best_about_contact_url(base: str, html: str) -> Optional[str]:
     if best_url:
         return best_url
 
-    # one fallback guess only
     for p in FALLBACK_PATHS:
         u = urljoin(base, p)
-        if u != base:
+        if dom(u) == base_dom:
             return u
     return None
 
 
-# -----------------------------
-# Snippet extraction (fast + small)
-# -----------------------------
-def _lines(text: str) -> List[str]:
-    return [ln.strip() for ln in text.splitlines() if ln.strip()]
+def collect_company_pages(session: requests.Session, official_home: str) -> List[Tuple[str, str]]:
+    """
+    Return list of (url, html) pages to mine.
+    """
+    pages: List[Tuple[str, str]] = []
+    base = root(official_home)
+
+    # homepage
+    home_html = fetch_html(session, base)
+    if home_html:
+        pages.append((base, home_html))
+    else:
+        return pages
+
+    # /directory (optional)
+    if TRY_DIRECTORY and len(pages) < MAX_PAGES_PER_COMPANY:
+        dir_url = add_directory_path(base)
+        dir_html = fetch_html(session, dir_url)
+        if dir_html:
+            pages.append((dir_url, dir_html))
+
+    # best contact-like from homepage
+    if len(pages) < MAX_PAGES_PER_COMPANY:
+        extra = best_contact_like_url(base, home_html)
+        if extra:
+            extra_html = fetch_html(session, extra)
+            if extra_html:
+                pages.append((extra, extra_html))
+
+    # one more fallback path if still small
+    if len(pages) < MAX_PAGES_PER_COMPANY:
+        for p in FALLBACK_PATHS:
+            u = urljoin(base, p)
+            if all(u != x[0] for x in pages):
+                h = fetch_html(session, u)
+                if h:
+                    pages.append((u, h))
+                    break
+
+    return pages[:MAX_PAGES_PER_COMPANY]
 
 
-def signal_lines(soup: BeautifulSoup, window: int = 2, max_lines: int = 140) -> str:
-    lines = _lines(soup.get_text("\n"))
-    keep = set()
+def extract_contacts_from_pages(pages: List[Tuple[str, str]]) -> Dict[str, Any]:
+    """
+    Deterministic extraction across pages, pick best source.
+    """
+    all_emails: Set[str] = set()
+    all_phones: Set[str] = set()
+    company_name: Optional[str] = None
+    address: Optional[str] = None
 
-    for i, ln in enumerate(lines):
-        if EMAIL_RE.search(ln) or PHONE_RE.search(ln) or ADDR_HINT_RE.search(ln):
-            for j in range(max(0, i - window), min(len(lines), i + window + 1)):
-                keep.add(j)
+    best_source_url: Optional[str] = None
+    best_score = -1
+    notes = []
 
-    picked = [lines[i] for i in sorted(keep)]
-    if not picked:
-        picked = lines[:40]
-    return "\n".join(picked[:max_lines])
+    for url, html in pages:
+        # HTML parsing
+        soup = BeautifulSoup(html, "html.parser")
 
+        # mailto/tel
+        emails_mt, phones_tel = extract_mailto_tel(soup)
 
-def snippet(html: str, url: str) -> str:
-    soup = BeautifulSoup(html, "html.parser")
-    for tag in soup(["script", "style", "noscript", "svg"]):
-        tag.decompose()
+        # regex find in raw text too (sometimes no mailto)
+        text = soup.get_text("\n")
+        emails_rx = set(EMAIL_RE.findall(text))
+        phones_rx = set(PHONE_RE.findall(text))
 
-    # header/footer are usually where contact lives
-    header = soup.find("header")
-    footer = soup.find("footer")
+        # schema.org
+        org = parse_jsonld_for_org(html)
 
-    parts = []
+        # page-level aggregation
+        page_emails = set()
+        page_phones = set()
+        page_emails |= emails_mt | emails_rx | set(org["emails"])
+        page_phones |= phones_tel | phones_rx | set(org["phones"])
 
-    if header:
-        parts.append(f"--- HEADER ({url}) ---\n" + "\n".join(_lines(header.get_text("\n")))[:2500])
-    if footer:
-        parts.append(f"--- FOOTER ({url}) ---\n" + "\n".join(_lines(footer.get_text("\n")))[:5000])
+        # clean obvious junk phones (very short)
+        page_phones = {p.strip() for p in page_phones if isinstance(p, str) and len(p.strip()) >= 7}
+        page_emails = {e.strip() for e in page_emails if isinstance(e, str) and "@" in e}
 
-    parts.append(f"--- SIGNAL ({url}) ---\n" + signal_lines(soup))
+        # address signals
+        page_addr = org.get("address") or signal_address_from_text(html)
 
-    out = "\n\n".join(parts).strip()
-    return out[:MAX_SNIPPET_CHARS_PER_PAGE]
+        # name signals
+        page_name = org.get("name") or get_title_or_og_name(html)
 
+        # score this page as a source
+        score = 0
+        if page_emails: score += 6
+        if page_phones: score += 4
+        if page_addr: score += 2
+        if page_name: score += 1
 
-# -----------------------------
-# Site processing (homepage + maybe 1 extra page)
-# -----------------------------
-def fetch_site_payload(session: requests.Session, seed_url: str) -> Dict[str, Any]:
-    r = root(seed_url)
-    d = dom(r)
+        if score > best_score:
+            best_score = score
+            best_source_url = url
 
-    payload = {"domain": d, "pages": []}
+        # global agg
+        all_emails |= page_emails
+        all_phones |= page_phones
+        if page_addr and not address:
+            address = page_addr
+        if page_name and (not company_name):
+            company_name = page_name
 
-    home_html = fetch_html(session, r)
-    if not home_html:
-        return payload  # empty pages -> will be skipped
+    # confidence
+    if all_emails and all_phones:
+        confidence = "high"
+    elif all_emails or all_phones:
+        confidence = "medium"
+    else:
+        confidence = "low"
+        notes.append("No email/phone found; site may be JS-rendered or hiding contact info.")
 
-    home_snip = snippet(home_html, r)
-    payload["pages"].append({"url": r, "snippet": home_snip})
+    # lightly prefer business-y emails if many
+    preferred_emails = sorted(all_emails, key=lambda e: (0 if any(e.lower().startswith(p) for p in ("info@", "sales@", "contact@", "support@")) else 1, e.lower()))
+    preferred_phones = sorted(all_phones)
 
-    # Speedup: if homepage already has email/phone, don't fetch extra page.
-    if EMAIL_RE.search(home_snip) or PHONE_RE.search(home_snip):
-        return payload
+    # normalize company name if it's just a generic title
+    if company_name:
+        # trim common separators
+        company_name = company_name.split("|")[0].split("–")[0].split("-")[0].strip() or company_name
 
-    extra = best_about_contact_url(r, home_html)
-    if extra:
-        extra_html = fetch_html(session, extra)
-        if extra_html:
-            extra_snip = snippet(extra_html, extra)
-            remaining = max(0, MAX_SITE_CHARS - len(home_snip))
-            payload["pages"].append({"url": extra, "snippet": extra_snip[:remaining]})
-
-    # enforce per-site cap
-    combined_len = sum(len(p["snippet"]) for p in payload["pages"])
-    if combined_len > MAX_SITE_CHARS and payload["pages"]:
-        # trim last page snippet
-        overflow = combined_len - MAX_SITE_CHARS
-        payload["pages"][-1]["snippet"] = payload["pages"][-1]["snippet"][:-overflow]
-
-    return payload
-
-
-def trim_sites_to_budget(sites: List[Dict[str, Any]], max_chars: int) -> List[Dict[str, Any]]:
-    out, total = [], 0
-    for s in sites:
-        s_text = json.dumps(s, ensure_ascii=False)
-        if total + len(s_text) > max_chars:
-            break
-        out.append(s)
-        total += len(s_text)
-    return out
-
-
-# -----------------------------
-# One Gemini call for all sites
-# -----------------------------
-def gemini_one_call(client: genai.Client, sites: List[Dict[str, Any]], model: str = "gemini-3-flash-preview") -> List[Dict[str, Any]]:
-    prompt = f"""
-You are doing BUSINESS contact discovery.
-
-Input is JSON of multiple websites, each with:
-- domain
-- pages: list of objects with url and high-signal snippet text (header/footer + lines near emails/phones/addresses)
-
-Task:
-For EACH domain, output ONE best row as JSON with exactly these keys:
-{{
-  "domain": string,
-  "company_name": string|null,
-  "emails": string[],
-  "phones": string[],
-  "address": string|null,
-  "country": string|null,
-  "best_source_url": string|null,
-  "confidence": number,   // 0.0 to 1.0
-  "notes": string|null
-}}
-
-Rules:
-- Use ONLY provided snippets. Do NOT invent.
-- If missing, use null or empty arrays.
-- Prefer business emails (info@, sales@, contact@).
-- best_source_url should point to the page where the best contact details are found.
-- Output MUST be JSON only and match this top-level structure:
-{{ "rows": [ ... ] }}
-
-INPUT JSON:
-{json.dumps(sites, ensure_ascii=False)}
-""".strip()
-
-    resp = client.models.generate_content(
-        model=model,
-        contents=prompt,
-        config=types.GenerateContentConfig(response_mime_type="application/json", temperature=0.2),
-    )
-
-    raw = (resp.text or "").strip()
-    try:
-        data = json.loads(raw)
-    except json.JSONDecodeError:
-        m = re.search(r"\{.*\}", raw, re.DOTALL)
-        data = json.loads(m.group(0)) if m else {"rows": []}
-
-    rows = data.get("rows", [])
-    if not isinstance(rows, list):
-        return []
-
-    def as_list(x):
-        if isinstance(x, list):
-            return [str(i).strip() for i in x if str(i).strip()]
-        if isinstance(x, str) and x.strip():
-            return [x.strip()]
-        return []
-
-    cleaned = []
-    for r in rows:
-        if not isinstance(r, dict):
-            continue
-        conf_raw = r.get("confidence")
-        try:
-            conf = float(conf_raw) if str(conf_raw).strip() else 0.0
-        except Exception:
-            conf = 0.0
-
-        cleaned.append({
-            "domain": r.get("domain"),
-            "company_name": r.get("company_name") if isinstance(r.get("company_name"), (str, type(None))) else None,
-            "emails": as_list(r.get("emails")),
-            "phones": as_list(r.get("phones")),
-            "address": r.get("address") if isinstance(r.get("address"), (str, type(None))) else None,
-            "country": r.get("country") if isinstance(r.get("country"), (str, type(None))) else None,
-            "best_source_url": r.get("best_source_url") if isinstance(r.get("best_source_url"), (str, type(None))) else None,
-            "confidence": max(0.0, min(1.0, conf)),
-            "notes": r.get("notes") if isinstance(r.get("notes"), (str, type(None))) else None,
-        })
-
-    return cleaned
+    return {
+        "company_name": company_name,
+        "emails": preferred_emails,
+        "phones": preferred_phones,
+        "address": address,
+        "best_source_url": best_source_url,
+        "confidence": confidence,
+        "notes": " ".join(notes) if notes else "",
+    }
 
 
 # -----------------------------
-# Main
+# Official site discovery per company name
+# -----------------------------
+def find_official_site(session: requests.Session, company_name: str, country_hint: str) -> Optional[str]:
+    """
+    Use SerpAPI to find official site candidates for a company name.
+    """
+    q_variants = [
+        f'"{company_name}" official website {country_hint}',
+        f'"{company_name}" contact {country_hint}',
+        f'{company_name} {country_hint} official site',
+    ]
+
+    gathered: List[Dict[str, Any]] = []
+    for q in q_variants:
+        for page in range(OFFICIAL_SERP_PAGES):
+            start = page * OFFICIAL_SERP_PAGE_SIZE
+            try:
+                gathered.extend(serpapi_search(session, q, OFFICIAL_SERP_PAGE_SIZE, start))
+            except Exception:
+                continue
+
+    candidates = pick_official_site_candidates(gathered, want=5)
+    return candidates[0] if candidates else None
+
+
+# -----------------------------
+# Printing
+# -----------------------------
+def print_rank_list(companies: List[str]) -> None:
+    print("\n========== TOP COMPANIES ==========\n")
+    for i, c in enumerate(companies, 1):
+        print(f"{i}. {c}")
+    print("-" * 70)
+
+
+def print_contact_rows(rows: List[Dict[str, Any]]) -> None:
+    print("\n========== CONTACT RESULTS ==========\n")
+    for i, r in enumerate(rows, 1):
+        print(f"{i}. {r.get('company_name') or 'Unknown'}")
+        print(f"   Website     : {r.get('website')}")
+        print(f"   Emails      : {r.get('emails')}")
+        print(f"   Phones      : {r.get('phones')}")
+        print(f"   Address     : {r.get('address')}")
+        print(f"   Best Source : {r.get('best_source_url')}")
+        print(f"   Confidence  : {r.get('confidence')}")
+        if r.get("notes"):
+            print(f"   Notes       : {r.get('notes')}")
+        print("-" * 70)
+
+
+# -----------------------------
+# MAIN
 # -----------------------------
 def main():
     load_keys()
-    query = input("Enter your business discovery query: ").strip()
-    if not query:
-        print("No query entered.")
+    user_query = input("Enter your query: ").strip()
+    if not user_query:
         return
 
     session = requests.Session()
-
-    # 1) Search
-    links = serpapi_links(session, query, n=MAX_SERP_RESULTS)
-
-    # 2) Dedupe by domain
-    uniq = {}
-    for u in links:
-        d = dom(u)
-        if d not in uniq:
-            uniq[d] = u
-    seeds = list(uniq.values())[:MAX_SERP_RESULTS]
-    print(f"\nSERP links: {len(links)} | Unique domains: {len(seeds)}\n")
-
-    # 3) Fetch snippets in parallel
-    site_payloads: List[Dict[str, Any]] = []
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
-        futures = [ex.submit(fetch_site_payload, session, u) for u in seeds]
-        for i, fut in enumerate(as_completed(futures), start=1):
-            payload = fut.result()
-            if payload.get("pages"):
-                site_payloads.append(payload)
-            print(f"[fetch {i}/{len(seeds)}] {payload.get('domain')} pages={len(payload.get('pages', []))}")
-
-    # 4) Enforce global input budget for one call
-    site_payloads = trim_sites_to_budget(site_payloads, MAX_TOTAL_INPUT_CHARS)
-    print(f"\nSites sent to Gemini (budgeted): {len(site_payloads)}\n")
-
-    # 5) One Gemini call
     client = genai.Client()
-    rows = gemini_one_call(client, site_payloads)
 
-    # 6) Output final JSON
-    out_file = "contacts_table.json"
-    with open(out_file, "w", encoding="utf-8") as f:
-        json.dump({"query": query, "rows": rows}, f, ensure_ascii=False, indent=2)
+    rank_mode = is_rank_query(user_query)
+    country_hint, industry_hint = infer_country_and_industry(user_query)
 
-    print(f"Saved: {out_file} | Rows: {len(rows)}")
+    if rank_mode:
+        # -------------------------
+        # RANK THEN CONTACT (ChatGPT-like)
+        # -------------------------
+        # 1) Find ranking/list sources
+        rank_queries = [
+            user_query,
+            f"top {industry_hint} companies in {country_hint}",
+            f"largest {industry_hint} companies in {country_hint} list",
+            f"leading {industry_hint} manufacturers in {country_hint}",
+            f"{industry_hint} industry {country_hint} top companies",
+        ]
+
+        all_rank_results: List[Dict[str, Any]] = []
+        for q in rank_queries:
+            for page in range(RANK_SERP_PAGES):
+                start = page * RANK_SERP_PAGE_SIZE
+                try:
+                    all_rank_results.extend(serpapi_search(session, q, RANK_SERP_PAGE_SIZE, start))
+                except Exception:
+                    continue
+
+        rank_sources_urls = pick_rank_sources(all_rank_results, want=RANK_FETCH_PAGES)
+        if not rank_sources_urls:
+            print("\nNo rank sources found. Try a broader query.\n")
+            return
+
+        print(f"\n[rank] Selected {len(rank_sources_urls)} ranking sources.\n")
+
+        # 2) Fetch ranking sources and convert to readable text
+        texts: List[str] = []
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
+            futures = [ex.submit(fetch_html, session, u) for u in rank_sources_urls]
+            for idx, fut in enumerate(as_completed(futures), start=1):
+                html = fut.result()
+                u = rank_sources_urls[idx - 1] if idx - 1 < len(rank_sources_urls) else ""
+                if html:
+                    texts.append(html_to_readable_text(html, u))
+                    print(f"[rank fetch {idx}/{len(rank_sources_urls)}] OK")
+                else:
+                    print(f"[rank fetch {idx}/{len(rank_sources_urls)}] FAIL")
+
+        if not texts:
+            print("\nCould not fetch any ranking source pages.\n")
+            return
+
+        # 3) Gemini call #1: extract top company names
+        companies = gemini_extract_top_companies(
+            client=client,
+            sources=texts,
+            country_hint=country_hint,
+            industry_hint=industry_hint,
+            top_n=TOP_N
+        )
+
+        if not companies:
+            print("\nGemini couldn't extract company names from the sources. Try adjusting the query.\n")
+            return
+
+        print_rank_list(companies)
+
+        # 4) For each company: find official site, fetch pages, extract contacts deterministically
+        rows: List[Dict[str, Any]] = []
+
+        def company_worker(name: str) -> Dict[str, Any]:
+            site = find_official_site(session, name, country_hint=country_hint)
+            if not site:
+                return {
+                    "company_name": name,
+                    "website": None,
+                    "emails": [],
+                    "phones": [],
+                    "address": None,
+                    "best_source_url": None,
+                    "confidence": "low",
+                    "notes": "Could not confidently find an official website via search.",
+                }
+            pages = collect_company_pages(session, site)
+            extracted = extract_contacts_from_pages(pages) if pages else {
+                "company_name": name, "emails": [], "phones": [], "address": None,
+                "best_source_url": None, "confidence": "low", "notes": "Could not fetch pages from official site."
+            }
+            # Prefer the company name we started with if the page title is generic
+            if extracted.get("company_name") and len(extracted["company_name"]) < 3:
+                extracted["company_name"] = name
+            if not extracted.get("company_name"):
+                extracted["company_name"] = name
+
+            extracted["website"] = root(site)
+            return extracted
+
+        print("\n[contact] Finding official sites + extracting contacts...\n")
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
+            futures = [ex.submit(company_worker, c) for c in companies]
+            for idx, fut in enumerate(as_completed(futures), start=1):
+                r = fut.result()
+                print(f"[contact {idx}/{len(companies)}] {r.get('company_name')} -> {r.get('confidence')}")
+                rows.append(r)
+
+        # 5) Print contacts
+        # keep same order as companies
+        name_to_row = {r["company_name"]: r for r in rows}
+        ordered_rows = []
+        for c in companies:
+            # row might have slightly different name from extraction; fallback by prefix match
+            exact = None
+            for r in rows:
+                if r.get("company_name") == c:
+                    exact = r
+                    break
+            ordered_rows.append(exact if exact else next((r for r in rows if (r.get("company_name") or "").lower().startswith(c.lower()[:8])), name_to_row.get(c, {"company_name": c})))
+
+        print_contact_rows(ordered_rows)
+        return
+
+    # -------------------------
+    # CONTACT ONLY
+    # -------------------------
+    # If the user didn't ask for a "top/best" list, treat it as targeted discovery.
+    # We'll try to find 20 candidate official domains and extract contacts from each.
+    print("\n[mode] CONTACT ONLY\n")
+
+    # Build search queries to find official sites
+    negative = (
+        "-linkedin -facebook -instagram -youtube -alibaba -indiamart "
+        "-made-in-china -globalsources -yellowpages -yelp -justdial -pdf"
+    )
+    q_variants = [
+        f"{user_query} official website {negative}",
+        f"{user_query} contact email phone address {negative}",
+        f"{user_query} headquarters address phone {negative}",
+    ]
+
+    all_results: List[Dict[str, Any]] = []
+    for q in q_variants:
+        for page in range(OFFICIAL_SERP_PAGES):
+            start = page * OFFICIAL_SERP_PAGE_SIZE
+            try:
+                all_results.extend(serpapi_search(session, q, OFFICIAL_SERP_PAGE_SIZE, start))
+            except Exception:
+                continue
+
+    seeds = pick_official_site_candidates(all_results, want=WANT_SITES)
+    print(f"\nSelected {len(seeds)} candidate sites.\n")
+    if not seeds:
+        print("No sites found. Try refining your query.")
+        return
+
+    rows: List[Dict[str, Any]] = []
+
+    def seed_worker(seed: str) -> Dict[str, Any]:
+        pages = collect_company_pages(session, seed)
+        extracted = extract_contacts_from_pages(pages) if pages else {
+            "company_name": None, "emails": [], "phones": [], "address": None,
+            "best_source_url": None, "confidence": "low", "notes": "Could not fetch pages."
+        }
+        extracted["website"] = root(seed)
+        return extracted
+
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
+        futures = [ex.submit(seed_worker, s) for s in seeds]
+        for idx, fut in enumerate(as_completed(futures), start=1):
+            r = fut.result()
+            print(f"[site {idx}/{len(seeds)}] {r.get('website')} -> {r.get('confidence')}")
+            rows.append(r)
+
+    print_contact_rows(rows)
 
 
 if __name__ == "__main__":
