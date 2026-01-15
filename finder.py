@@ -30,46 +30,83 @@ if not GEMINI_KEY:
 
 HEADERS = {"User-Agent": "VendorContactFinder/1.0 (+contact: you@example.com)"}
 
-# IMPORTANT: We still keep CONTACT_HINTS for broad matching,
-# but scoring will prioritize "contact" > "imprint/legal" > "sales/team" > "locations" > "about"
-CONTACT_HINTS = (
-    "contact", "contact-us", "kontakt",
-    "impressum", "imprint", "legal",
-    "sales", "team", "staff", "people",
-    "locations", "location", "store-locator", "where-to-buy", "find-us", "findus",
-    "about", "about-us", "unternehmen", "ueber-uns", "über-uns",
-)
+# Higher priority keywords for finding the right page
+CONTACT_PRIORITY = ["contact", "contact-us", "kontakt", "get-in-touch", "reach-us", "connect", "call-us", "support"]
+LEGAL_PRIORITY = ["impressum", "imprint", "legal", "privacy", "terms"]
+SALES_PRIORITY = ["sales", "request-quote", "quote", "inquiry", "enquiry", "team", "staff", "people", "customer-service"]
+LOC_PRIORITY = ["where-to-buy", "locations", "location", "store-locator", "find-us", "findus"]
+ABOUT_PRIORITY = ["about", "about-us", "ueber-uns", "über-uns", "unternehmen"]
 
-# IMPORTANT: Try CONTACT first, then imprint/legal, then sales/team, then locations, then about
+CONTACT_HINTS = tuple(CONTACT_PRIORITY + LEGAL_PRIORITY + SALES_PRIORITY + LOC_PRIORITY + ABOUT_PRIORITY)
+
 COMMON_FALLBACK_PATHS = (
-    "/contact", "/contact-us", "/kontakt",
+    "/contact", "/contact-us", "/kontakt", "/get-in-touch", "/reach-us", "/support",
     "/impressum", "/imprint", "/legal",
-    "/sales", "/team", "/staff", "/people",
+    "/sales", "/request-quote", "/quote", "/team",
     "/where-to-buy", "/locations", "/location", "/store-locator",
     "/about", "/about-us", "/ueber-uns", "/über-uns",
 )
 
-MAX_HTML_CHARS_PER_SITE = 120_000     # cost control
+MAX_HTML_CHARS_PER_SITE = 90_000      # reduce slightly for speed; still enough for contact pages
 THREADS = 12                          # crawl parallelism
 GEMINI_BATCH_SIZE = 3                 # 2-3 websites per call
-POLITE_DELAY = 0.15                   # keep low but non-zero
+GEMINI_WORKERS = 3                    # parallel gemini calls (keep small to avoid rate limits)
+POLITE_DELAY = 0.12                   # small delay
+REQUEST_TIMEOUT = 15
 
 
 # ----------------------------
 # Utility: safe JSON parse
 # ----------------------------
 def parse_json_loose(raw: str) -> Any:
-    raw = (raw or "").strip()
+    """
+    Robust JSON extractor:
+    - Handles text before/after JSON
+    - Handles multiple JSON blocks
+    - Safely extracts the FIRST valid JSON object or array
+    """
+    if not raw:
+        raise ValueError("Empty response")
+
+    raw = raw.strip()
+
+    # 1) Try direct parse first (fast path)
     try:
         return json.loads(raw)
     except Exception:
-        m_obj = re.search(r"\{.*\}", raw, re.DOTALL)
-        if m_obj:
-            return json.loads(m_obj.group(0))
-        m_arr = re.search(r"\[.*\]", raw, re.DOTALL)
-        if m_arr:
-            return json.loads(m_arr.group(0))
-        raise ValueError("Model output is not valid JSON:\n" + raw[:2000])
+        pass
+
+    # 2) Find first JSON object or array by balanced braces
+    def extract_first_json(s: str) -> Optional[str]:
+        stack = []
+        start = None
+
+        for i, ch in enumerate(s):
+            if ch in "{[":
+                if not stack:
+                    start = i
+                stack.append(ch)
+
+            elif ch in "}]":
+                if not stack:
+                    continue
+                stack.pop()
+                if not stack and start is not None:
+                    return s[start:i + 1]
+
+        return None
+
+    candidate = extract_first_json(raw)
+    if not candidate:
+        raise ValueError("No valid JSON found in response:\n" + raw[:1000])
+
+    try:
+        return json.loads(candidate)
+    except Exception as e:
+        raise ValueError(
+            "Extracted JSON but failed to parse:\n"
+            + candidate[:1000]
+        ) from e
 
 
 def normalize_candidates(discovery: Any) -> List[Dict[str, str]]:
@@ -139,13 +176,13 @@ Rules:
 - JSON ONLY. No extra keys. No explanation.
 """
 
-def discover_candidates(user_query: str, max_candidates: int = 10) -> List[Dict[str, str]]:
+def discover_candidates(user_query: str, max_candidates: int = 20) -> List[Dict[str, str]]:
     prompt = f"""
 User query: {user_query}
 Return up to {max_candidates} candidate companies with official websites.
 JSON only.
 """
-    print(f"[DISCOVER] Query: {user_query}")
+    print(f"[DISCOVER] query='{user_query}'")
     resp = pplx_client.chat.completions.create(
         model="sonar",
         messages=[
@@ -156,8 +193,59 @@ JSON only.
     raw = resp.choices[0].message.content
     parsed = parse_json_loose(raw)
     candidates = normalize_candidates(parsed)[:max_candidates]
-    print(f"[DISCOVER] Found {len(candidates)} candidate websites")
+    print(f"[DISCOVER] candidates={len(candidates)}")
+    for i, c in enumerate(candidates, 1):
+        print(f"  {i}. {c['business_name']} -> {c['website']}")
     return candidates
+
+
+# ----------------------------
+# Local extraction (cheap backfill)
+# ----------------------------
+EMAIL_RE = re.compile(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}")
+PHONE_RE = re.compile(r"(?:(?:\+|00)\s?\d{1,3}[\s\-\.]?)?(?:\(?\d{2,4}\)?[\s\-\.]?)?\d{3,4}[\s\-\.]?\d{3,4}(?:[\s\-\.]?\d{1,4})?")
+
+def normalize_phone(p: str) -> Optional[str]:
+    cleaned = re.sub(r"[^\d+]", "", p)
+    digits = re.sub(r"\D", "", cleaned)
+    if len(digits) < 7 or len(digits) > 18:
+        return None
+    return cleaned
+
+def deobfuscate_text(s: str) -> str:
+    s = re.sub(r"\s*\[\s*at\s*\]\s*|\s*\(\s*at\s*\)\s*|\s+at\s+", "@", s, flags=re.I)
+    s = re.sub(r"\s*\[\s*dot\s*\]\s*|\s*\(\s*dot\s*\)\s*|\s+dot\s+", ".", s, flags=re.I)
+    return s
+
+def extract_local_contacts_from_soup(soup: BeautifulSoup) -> Dict[str, List[str]]:
+    # visible text
+    text = soup.get_text(" ", strip=True)
+    text = deobfuscate_text(text)
+
+    emails = set(e.lower() for e in EMAIL_RE.findall(text))
+    phones = set()
+
+    for m in PHONE_RE.findall(text):
+        n = normalize_phone(m)
+        if n:
+            phones.add(n)
+
+    # mailto / tel
+    for a in soup.select('a[href^="mailto:"]'):
+        e = a.get("href", "").replace("mailto:", "").split("?")[0].strip().lower()
+        if e:
+            emails.add(e)
+
+    for a in soup.select('a[href^="tel:"]'):
+        p = a.get("href", "").replace("tel:", "").split("?")[0].strip()
+        n = normalize_phone(p)
+        if n:
+            phones.add(n)
+
+    # remove common placeholders
+    emails = {e for e in emails if "example.com" not in e and "email.com" not in e}
+
+    return {"emails": sorted(emails), "phone_numbers": sorted(phones)}
 
 
 # ----------------------------
@@ -168,7 +256,7 @@ def same_reg_domain(base_url: str, other_url: str) -> bool:
     o = tldextract.extract(other_url)
     return (b.domain, b.suffix) == (o.domain, o.suffix)
 
-def fetch_html(url: str, timeout: int = 15) -> Optional[str]:
+def fetch_html(url: str, timeout: int = REQUEST_TIMEOUT) -> Optional[str]:
     try:
         r = requests.get(url, headers=HEADERS, timeout=timeout, allow_redirects=True)
         if r.status_code >= 400:
@@ -180,15 +268,41 @@ def fetch_html(url: str, timeout: int = 15) -> Optional[str]:
     except Exception:
         return None
 
-def clean_and_truncate_html(html: str, max_chars: int = MAX_HTML_CHARS_PER_SITE) -> str:
+def clean_html_to_evidence(html: str, max_chars: int = MAX_HTML_CHARS_PER_SITE) -> Tuple[str, Dict[str, List[str]]]:
+    """
+    Cost/time reducer:
+    - remove scripts/styles/iframes
+    - keep only text-ish content
+    - truncate
+    - also do local extraction from the cleaned soup
+    """
     soup = BeautifulSoup(html, "html.parser")
     for tag in soup(["script", "style", "noscript", "svg", "canvas", "iframe"]):
         tag.decompose()
-    cleaned = str(soup)
-    cleaned = re.sub(r"\s+", " ", cleaned).strip()
-    if len(cleaned) > max_chars:
-        cleaned = cleaned[:max_chars]
-    return cleaned
+
+    local = extract_local_contacts_from_soup(soup)
+
+    # Build "evidence" string (faster for Gemini than full HTML)
+    # include hrefs to help Gemini see mailto/tel even if not visible
+    hrefs = []
+    for a in soup.select("a[href]"):
+        h = a.get("href")
+        if h and (h.startswith("mailto:") or h.startswith("tel:")):
+            hrefs.append(h)
+        if len(hrefs) >= 40:
+            break
+
+    text = soup.get_text("\n", strip=True)
+    text = deobfuscate_text(text)
+    text = re.sub(r"\n{2,}", "\n", text)
+
+    evidence = "LINK_HINTS:\n" + "\n".join(hrefs) + "\n\nPAGE_TEXT:\n" + text
+    evidence = re.sub(r"[ \t]+", " ", evidence).strip()
+
+    if len(evidence) > max_chars:
+        evidence = evidence[:max_chars]
+
+    return evidence, local
 
 def extract_internal_links(base_url: str, html: str, limit: int = 250) -> List[str]:
     soup = BeautifulSoup(html, "html.parser")
@@ -207,60 +321,65 @@ def extract_internal_links(base_url: str, html: str, limit: int = 250) -> List[s
 def score_contact_link(url: str) -> Tuple[int, int]:
     """
     Prioritize:
-      0) contact
-      1) impressum/imprint/legal
-      2) sales/team/staff/people
-      3) locations/where-to-buy/store-locator
+      0) contact/support/get-in-touch
+      1) imprint/legal
+      2) sales/team/quote
+      3) locations/where-to-buy
       4) about
       5) everything else
     """
     path = (urlparse(url).path or "").lower()
 
-    if any(k in path for k in ["contact", "contact-us", "kontakt"]):
+    if any(k in path for k in CONTACT_PRIORITY):
         bucket = 0
-    elif any(k in path for k in ["impressum", "imprint", "legal"]):
+    elif any(k in path for k in LEGAL_PRIORITY):
         bucket = 1
-    elif any(k in path for k in ["sales", "team", "staff", "people"]):
+    elif any(k in path for k in SALES_PRIORITY):
         bucket = 2
-    elif any(k in path for k in ["where-to-buy", "locations", "location", "store-locator", "find-us", "findus"]):
+    elif any(k in path for k in LOC_PRIORITY):
         bucket = 3
-    elif any(k in path for k in ["about", "about-us", "ueber-uns", "über-uns", "unternehmen"]):
+    elif any(k in path for k in ABOUT_PRIORITY):
         bucket = 4
     else:
         bucket = 5
 
-    # Shorter paths generally better; also prefer non-empty paths
     return (bucket, len(path))
 
-def pick_best_contact_page(home_url: str, home_html: str) -> Optional[str]:
+def pick_top_pages(home_url: str, home_html: str, top_k: int = 3) -> List[str]:
+    """
+    Return up to top_k internal pages ranked by score.
+    """
     links = extract_internal_links(home_url, home_html)
-    links_sorted = sorted(links, key=score_contact_link)
+    ranked = sorted(links, key=score_contact_link)
 
-    # Choose first strongly relevant link
-    for u in links_sorted[:120]:
+    picked = []
+    for u in ranked:
         path = (urlparse(u).path or "").lower()
         if any(h in path for h in CONTACT_HINTS):
-            return u
-    return None
+            if u not in picked:
+                picked.append(u)
+        if len(picked) >= top_k:
+            break
+    return picked
 
-def try_fallback_paths(home_url: str) -> Optional[str]:
+def try_fallback_paths(home_url: str) -> List[str]:
     parsed = urlparse(home_url)
     base = f"{parsed.scheme}://{parsed.netloc}"
+    out = []
     for p in COMMON_FALLBACK_PATHS:
-        candidate = base + p
-        html = fetch_html(candidate)
-        if html:
-            return candidate
-        time.sleep(POLITE_DELAY)
-    return None
-
+        out.append(base + p)
+    return out
 
 @dataclass
 class CrawledSite:
     business_name: str
     website: str
     source_page: str
-    html: str
+    evidence: str
+    local_emails: List[str]
+    local_phones: List[str]
+    extra_pages: List[str]  # for 2nd-pass retry
+
 
 def normalize_website(url: str) -> str:
     url = url.strip()
@@ -268,92 +387,105 @@ def normalize_website(url: str) -> str:
         return "https://" + url
     return url
 
-def crawl_one_site(business_name: str, website: str) -> Optional[CrawledSite]:
+def fetch_best_page_evidence(website: str, business_name: str) -> Optional[CrawledSite]:
     website = normalize_website(website)
 
-    print(f"[CRAWL] Start: {business_name} -> {website}")
-    home_html = fetch_html(website)
-    if not home_html:
-        print(f"[CRAWL] FAIL homepage fetch: {website}")
+    print(f"[CRAWL] {business_name} -> {website}")
+
+    home_raw = fetch_html(website)
+    if not home_raw:
+        print(f"[CRAWL]   FAIL homepage")
         return None
 
-    # 1) try best prioritized page found in homepage links
-    best_url = pick_best_contact_page(website, home_html)
-    if best_url:
-        print(f"[CRAWL] Selected from links: {best_url}")
-        page_html = fetch_html(best_url)
-        if page_html:
-            cleaned = clean_and_truncate_html(page_html)
-            print(f"[CRAWL] OK page fetch: {best_url} (chars={len(cleaned)})")
-            return CrawledSite(
-                business_name=business_name,
-                website=website,
-                source_page=best_url,
-                html=cleaned
-            )
-        else:
-            print(f"[CRAWL] FAIL page fetch (selected): {best_url}")
+    # Find best candidates from internal links
+    top_pages = pick_top_pages(website, home_raw, top_k=3)
 
-    # 2) fallback paths (contact first)
-    fallback = try_fallback_paths(website)
-    if fallback:
-        print(f"[CRAWL] Selected fallback: {fallback}")
-        fb_html = fetch_html(fallback)
-        if fb_html:
-            cleaned = clean_and_truncate_html(fb_html)
-            print(f"[CRAWL] OK fallback fetch: {fallback} (chars={len(cleaned)})")
-            return CrawledSite(
-                business_name=business_name,
-                website=website,
-                source_page=fallback,
-                html=cleaned
-            )
-        else:
-            print(f"[CRAWL] FAIL fallback fetch: {fallback}")
+    # Build a list of candidates to try in order (best link pages first, then fallback paths, then homepage)
+    candidates = []
+    candidates.extend(top_pages)
+    candidates.extend(try_fallback_paths(website))
+    candidates.append(website)
 
-    # 3) homepage fallback
-    cleaned_home = clean_and_truncate_html(home_html)
-    print(f"[CRAWL] Using homepage fallback (chars={len(cleaned_home)})")
+    tried = set()
+    extra_pages = []
+
+    for u in candidates:
+        if u in tried:
+            continue
+        tried.add(u)
+
+        time.sleep(POLITE_DELAY)
+        raw = fetch_html(u)
+        if not raw:
+            continue
+
+        evidence, local = clean_html_to_evidence(raw)
+        # Keep other high-ranked pages for retry (but don’t fetch now)
+        extra_pages = [x for x in top_pages if x != u][:2]
+        print(f"[CRAWL]   picked: {u}  (evidence_chars={len(evidence)}, local_emails={len(local['emails'])}, local_phones={len(local['phone_numbers'])})")
+
+        return CrawledSite(
+            business_name=business_name,
+            website=website,
+            source_page=u,
+            evidence=evidence,
+            local_emails=local["emails"],
+            local_phones=local["phone_numbers"],
+            extra_pages=extra_pages
+        )
+
+    # fallback: use homepage evidence even if link selection failed (should not hit often)
+    evidence, local = clean_html_to_evidence(home_raw)
+    print(f"[CRAWL]   fallback homepage (evidence_chars={len(evidence)})")
     return CrawledSite(
         business_name=business_name,
         website=website,
         source_page=website,
-        html=cleaned_home
+        evidence=evidence,
+        local_emails=local["emails"],
+        local_phones=local["phone_numbers"],
+        extra_pages=[]
     )
 
 def crawl_sites_parallel(candidates: List[Dict[str, str]], threads: int = THREADS) -> List[CrawledSite]:
+    print(f"[CRAWL] parallel threads={threads}")
     crawled: List[CrawledSite] = []
-    print(f"[CRAWL] Parallel crawling with {threads} threads...")
     with ThreadPoolExecutor(max_workers=threads) as ex:
-        futures = [ex.submit(crawl_one_site, c["business_name"], c["website"]) for c in candidates]
+        futures = [ex.submit(fetch_best_page_evidence, c["website"], c["business_name"]) for c in candidates]
         for fut in as_completed(futures):
             item = fut.result()
             if item:
                 crawled.append(item)
-    print(f"[CRAWL] Completed. Successfully crawled {len(crawled)} sites.")
+    print(f"[CRAWL] done ok={len(crawled)}")
     return crawled
 
 
 # ----------------------------
-# Gemini batch extraction
+# Gemini batch extraction (parallel)
 # ----------------------------
 gemini_client = genai.Client(api_key=GEMINI_KEY)
 
 GEMINI_PROMPT = """
 You are a strict information extraction engine.
 
-You will receive 2-3 website HTML documents. For each item, extract:
+You will receive 2-3 website documents. Each item contains:
+- business_name_hint
+- website
+- source_page
+- evidence (link hints + page text)
+
+Extract for each item:
 - business_name
 - phone_numbers
 - emails
 - addresses
 
 CRITICAL:
-- Extract ONLY what is present in the HTML. Do NOT guess.
+- Extract ONLY what is present in the evidence. Do NOT guess.
 - If unknown, use null or [].
 - Return JSON ONLY.
 
-Schema (return exactly this shape):
+Schema:
 {
   "vendors": [
     {
@@ -368,8 +500,8 @@ Schema (return exactly this shape):
 }
 
 Rules:
-- business_name: prefer official legal/company name in HTML; else business_name_hint; else null.
-- Also extract obfuscated emails like "info (at) domain (dot) com" if present.
+- business_name: prefer official legal/company name in evidence; else business_name_hint; else null.
+- Extract obfuscated emails like "info (at) domain (dot) com" if present.
 - Exclude placeholder emails like example@domain.com.
 - Deduplicate phones/emails/addresses.
 """
@@ -378,14 +510,13 @@ def chunk_list(items: List[Any], size: int) -> List[List[Any]]:
     return [items[i:i+size] for i in range(0, len(items), size)]
 
 def gemini_extract_batch(batch: List[CrawledSite]) -> List[Dict[str, Any]]:
-    print(f"[GEMINI] Extracting batch of {len(batch)} site(s)...")
     items = []
     for s in batch:
         items.append({
             "business_name_hint": s.business_name,
             "website": s.website,
             "source_page": s.source_page,
-            "html": s.html
+            "evidence": s.evidence
         })
 
     user_payload = {"items": items}
@@ -398,9 +529,102 @@ def gemini_extract_batch(batch: List[CrawledSite]) -> List[Dict[str, Any]]:
 
     raw = (resp.text or "").strip()
     parsed = parse_json_loose(raw)
-    vendors = normalize_gemini_vendors(parsed)
-    print(f"[GEMINI] Batch done. Extracted {len(vendors)} vendor record(s).")
-    return vendors
+    return normalize_gemini_vendors(parsed)
+
+def gemini_extract_all_parallel(crawled: List[CrawledSite]) -> List[Dict[str, Any]]:
+    batches = chunk_list(crawled, GEMINI_BATCH_SIZE)
+    print(f"[GEMINI] batches={len(batches)} batch_size={GEMINI_BATCH_SIZE} workers={GEMINI_WORKERS}")
+
+    results: List[Dict[str, Any]] = []
+    with ThreadPoolExecutor(max_workers=GEMINI_WORKERS) as ex:
+        fut_map = {ex.submit(gemini_extract_batch, b): b for b in batches}
+        for fut in as_completed(fut_map):
+            vendors = fut.result()
+            results.extend(vendors)
+
+    print(f"[GEMINI] extracted_records={len(results)}")
+    return results
+
+
+# ----------------------------
+# Backfill + retry
+# ----------------------------
+def build_site_index(crawled: List[CrawledSite]) -> Dict[str, CrawledSite]:
+    # key by canonical domain (or website string)
+    return {c.website: c for c in crawled}
+
+def backfill_vendor(v: Dict[str, Any], site: CrawledSite) -> Dict[str, Any]:
+    # Fill phones/emails from local extraction if Gemini missed
+    if not v.get("emails"):
+        v["emails"] = site.local_emails
+    if not v.get("phone_numbers"):
+        v["phone_numbers"] = site.local_phones
+
+    # Ensure website/source_page are filled
+    if not v.get("website"):
+        v["website"] = site.website
+    if not v.get("source_page"):
+        v["source_page"] = site.source_page
+
+    return v
+
+def needs_retry(v: Dict[str, Any]) -> bool:
+    return (not v.get("emails")) and (not v.get("phone_numbers"))
+
+def retry_failed_sites(failed_sites: List[CrawledSite]) -> List[CrawledSite]:
+    """
+    For each failed site:
+    - fetch ONE additional page (best extra page, else first fallback contact)
+    - merge evidence with existing evidence (truncate)
+    - update local contacts union
+    """
+    updated: List[CrawledSite] = []
+
+    for site in failed_sites:
+        # choose 1 extra page to try
+        extra = None
+        if site.extra_pages:
+            extra = site.extra_pages[0]
+        else:
+            # first fallback is usually /contact
+            fallbacks = try_fallback_paths(site.website)
+            extra = fallbacks[0] if fallbacks else None
+
+        if not extra:
+            updated.append(site)
+            continue
+
+        print(f"[RETRY] {site.business_name} -> fetching extra page: {extra}")
+        raw = fetch_html(extra)
+        if not raw:
+            print(f"[RETRY]   FAIL extra page")
+            updated.append(site)
+            continue
+
+        evidence2, local2 = clean_html_to_evidence(raw)
+
+        # merge evidence (keep short)
+        merged = (site.evidence + "\n\n----- EXTRA_PAGE -----\n\n" + evidence2).strip()
+        if len(merged) > MAX_HTML_CHARS_PER_SITE:
+            merged = merged[:MAX_HTML_CHARS_PER_SITE]
+
+        # union local contacts
+        emails = sorted(set(site.local_emails) | set(local2["emails"]))
+        phones = sorted(set(site.local_phones) | set(local2["phone_numbers"]))
+
+        updated.append(CrawledSite(
+            business_name=site.business_name,
+            website=site.website,
+            source_page=extra,           # update source to the extra page
+            evidence=merged,
+            local_emails=emails,
+            local_phones=phones,
+            extra_pages=site.extra_pages[1:] if site.extra_pages else []
+        ))
+
+        time.sleep(POLITE_DELAY)
+
+    return updated
 
 
 # ----------------------------
@@ -412,26 +636,58 @@ def run_pipeline(user_query: str, max_candidates: int = 10) -> Dict[str, Any]:
     if not candidates:
         return {"vendors": []}
 
-    for i, c in enumerate(candidates, start=1):
-        print(f"[DISCOVER] {i}. {c['business_name']} -> {c['website']}")
-
     # 2) Crawl in parallel
     crawled = crawl_sites_parallel(candidates, threads=THREADS)
     if not crawled:
         return {"vendors": []}
 
-    # 3) Gemini extraction in batches (2-3 per call)
-    all_vendors: List[Dict[str, Any]] = []
-    batches = chunk_list(crawled, GEMINI_BATCH_SIZE)
-    print(f"[PIPELINE] Sending {len(crawled)} crawled pages to Gemini in {len(batches)} batch(es)...")
+    # 3) Gemini extraction (parallel batches)
+    vendors = gemini_extract_all_parallel(crawled)
 
-    for idx, batch in enumerate(batches, start=1):
-        print(f"[PIPELINE] Gemini batch {idx}/{len(batches)}")
-        vendors = gemini_extract_batch(batch)
-        all_vendors.extend(vendors)
-        time.sleep(0.2)  # avoid hammering API
+    # 4) Backfill from local extraction
+    idx = build_site_index(crawled)
+    filled: List[Dict[str, Any]] = []
+    retry_targets: List[CrawledSite] = []
 
-    return {"vendors": all_vendors}
+    # Match returned vendors to crawled sites by website (best effort)
+    for v in vendors:
+        site = idx.get(v.get("website") or "", None)
+        if not site:
+            # If Gemini didn't return website, try to match by business_name hint
+            # (fallback: keep as-is)
+            filled.append(v)
+            continue
+
+        v2 = backfill_vendor(v, site)
+        filled.append(v2)
+
+        if needs_retry(v2):
+            retry_targets.append(site)
+
+    # 5) Retry only failed (phones+emails both empty)
+    if retry_targets:
+        print(f"[RETRY] targets={len(retry_targets)} -> second pass (only misses)")
+        updated_sites = retry_failed_sites(retry_targets)
+
+        # Gemini again only for those (parallel batches)
+        retry_results = gemini_extract_all_parallel(updated_sites)
+
+        # Backfill again and overwrite matching websites in filled list
+        retry_idx = {s.website: s for s in updated_sites}
+        retry_map = {}
+        for v in retry_results:
+            site = retry_idx.get(v.get("website") or "", None)
+            if site:
+                retry_map[site.website] = backfill_vendor(v, site)
+
+        # apply overwrite
+        for i, old in enumerate(filled):
+            w = old.get("website")
+            if w in retry_map:
+                filled[i] = retry_map[w]
+
+    # 6) Final output
+    return {"vendors": filled}
 
 
 # ----------------------------
@@ -442,7 +698,6 @@ if __name__ == "__main__":
         q = input("Describe the product/service vendors you need: ").strip()
         if not q:
             continue
-
         try:
             out = run_pipeline(q, max_candidates=10)
             print(json.dumps(out, indent=2, ensure_ascii=False))
