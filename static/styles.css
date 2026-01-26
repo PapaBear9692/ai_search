@@ -1,0 +1,145 @@
+:root {
+  --bg: #f6f7f9;
+  --card: #ffffff;
+  --border: rgba(0,0,0,.08);
+  --text: #0f172a;
+  --muted: #64748b;
+}
+
+body {
+  background: var(--bg);
+  color: var(--text);
+}
+
+.page {
+  min-height: 100vh;
+  display: flex;
+  align-items: flex-start;
+}
+
+.center-wrap {
+  max-width: 760px;
+  margin: 0 auto;
+  padding: 64px 12px 40px;
+}
+
+.brand .logo {
+  font-size: 40px;
+  font-weight: 700;
+  letter-spacing: .2px;
+}
+
+.brand .tagline {
+  margin-top: 6px;
+  color: var(--muted);
+  font-size: 14px;
+}
+
+.search-area {
+  width: 100%;
+}
+
+.search-box {
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 10px;
+  display: flex;
+  gap: 10px;
+  align-items: center;
+}
+
+.search-input {
+  border: none;
+  outline: none;
+  flex: 1;
+  font-size: 16px;
+  padding: 8px 14px;
+  background: transparent;
+}
+
+.search-btn {
+  border-radius: 999px;
+  padding: 10px 18px;
+  white-space: nowrap;
+}
+
+.loading {
+  display: flex;
+  align-items: center;
+}
+
+.results-panel {
+  margin-top: 18px;
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 16px;
+  overflow: hidden;
+}
+
+.results-header {
+  padding: 12px 14px;
+  border-bottom: 1px solid #f6f7f9;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  /* background: rgba(255,255,255,.8); */
+  background: #f6f7f9;
+}
+
+.results-list {
+  max-height: 420px;   /* scroll container height */
+  overflow-y: auto;    /* scrollbar */
+  padding: 12px;
+}
+
+.vendor-card {
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  padding: 12px 12px;
+  background: #fff;
+}
+
+.vendor-card + .vendor-card {
+  margin-top: 10px;
+}
+
+.vendor-title {
+  font-weight: 650;
+  margin-bottom: 6px;
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.vendor-meta {
+  font-size: 13px;
+  color: var(--muted);
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 4px;
+}
+
+.kv {
+  display: flex;
+  gap: 8px;
+}
+
+.k {
+  width: 86px;
+  color: #334155;
+  font-weight: 600;
+  flex: 0 0 auto;
+}
+
+.v a {
+  text-decoration: none;
+}
+
+.empty {
+  color: var(--muted);
+  padding: 18px;
+  text-align: center;
+  border: 1px dashed var(--border);
+  border-radius: 14px;
+}
